@@ -28,6 +28,7 @@ export function getTransportType(): TransportType {
 export async function connectTransport(
   server: Server,
   toolCount: number,
+  serverFactory?: () => Server,
 ): Promise<NowAIKitHttpServer | null> {
   const transportType = getTransportType();
 
@@ -42,9 +43,9 @@ export async function connectTransport(
   const httpServer = createHttpServer();
 
   if (transportType === 'sse') {
-    await setupSseTransport(server, httpServer);
+    await setupSseTransport(serverFactory || (() => server), httpServer);
   } else {
-    await setupStreamableHttpTransport(server, httpServer);
+    await setupStreamableHttpTransport(serverFactory || (() => server), httpServer);
   }
 
   logger.info(`NowAIKit server running on ${transportType} [${toolCount} tools]`);
@@ -53,23 +54,29 @@ export async function connectTransport(
 
 /**
  * SSE Transport — GET /sse opens an SSE stream, POST /messages sends client messages.
+ * Uses Factory Pattern: creates an isolated Server instance for each incoming SSE connection
+ * to prevent "Already connected to a transport" crashes on reconnect/multi-client.
  */
-async function setupSseTransport(server: Server, httpServer: NowAIKitHttpServer): Promise<void> {
+async function setupSseTransport(
+  serverFactory: () => Server,
+  httpServer: NowAIKitHttpServer,
+): Promise<void> {
   const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
 
-  const sessions = new Map<string, InstanceType<typeof SSEServerTransport>>();
+  const sessions = new Map<string, { transport: InstanceType<typeof SSEServerTransport>; server: Server }>();
 
   httpServer.get('/sse', async (req, res) => {
     const transport = new SSEServerTransport('/messages', res);
     const sessionId = transport.sessionId;
-    sessions.set(sessionId, transport);
+    const sessionServer = serverFactory();
+    sessions.set(sessionId, { transport, server: sessionServer });
 
     req.on('close', () => {
       sessions.delete(sessionId);
       logger.info(`SSE session closed: ${sessionId}`);
     });
 
-    await server.connect(transport);
+    await sessionServer.connect(transport);
     logger.info(`SSE session connected: ${sessionId}`);
   }, true);
 
@@ -83,7 +90,7 @@ async function setupSseTransport(server: Server, httpServer: NowAIKitHttpServer)
       return;
     }
 
-    const transport = sessions.get(sessionId)!;
+    const { transport } = sessions.get(sessionId)!;
     // Pass the already-parsed body (the HTTP server drained the stream) — same
     // reason as the streamable-HTTP path below.
     await transport.handlePostMessage(req, res, (req as { body?: unknown }).body);
@@ -96,42 +103,89 @@ async function setupSseTransport(server: Server, httpServer: NowAIKitHttpServer)
 
 /**
  * Streamable HTTP Transport — POST/GET/DELETE /mcp for all MCP communication.
+ * Handles multi-session and initialization cleanly.
  */
-async function setupStreamableHttpTransport(server: Server, httpServer: NowAIKitHttpServer): Promise<void> {
+async function setupStreamableHttpTransport(
+  serverFactory: () => Server,
+  httpServer: NowAIKitHttpServer,
+): Promise<void> {
   const { StreamableHTTPServerTransport } = await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
   const { randomUUID } = await import('crypto');
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
+  const sessions = new Map<string, { transport: InstanceType<typeof StreamableHTTPServerTransport>; server: Server }>();
+
+  const defaultServer = serverFactory();
+  const defaultTransport = new StreamableHTTPServerTransport();
+  await defaultServer.connect(defaultTransport);
 
   // Mount transport on /mcp
   httpServer.post('/mcp', async (req, res) => {
-    // DELEGATED_AUTH: bind the per-user identity/policy from headers for this
-    // request's lifetime (used by the ServiceNow client + permission checks).
-    // The HTTP server already drains + parses the POST body into req.body, so the
-    // stream is consumed by the time we get here. Pass that parsed body through to
-    // the MCP transport (3rd arg) — otherwise it re-reads an empty stream and the
-    // request fails with a JSON-RPC parse error (-32700).
     const parsedBody = (req as { body?: unknown }).body;
+    const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
+
+    const isInit = Array.isArray(parsedBody)
+      ? (parsedBody as any[]).some((m) => m?.method === 'initialize')
+      : (parsedBody as any)?.method === 'initialize';
+
+    if (isInit) {
+      const sessionServer = serverFactory();
+      const sessionTransport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+      });
+      await sessionServer.connect(sessionTransport);
+
+      if (isDelegatedAuthEnabled()) {
+        const ctx = parseDelegatedAuthHeaders(req.headers as Record<string, string | string[] | undefined>);
+        await runWithDelegatedAuth(ctx, () => sessionTransport.handleRequest(req, res, parsedBody));
+      } else {
+        await sessionTransport.handleRequest(req, res, parsedBody);
+      }
+
+      if (sessionTransport.sessionId) {
+        sessions.set(sessionTransport.sessionId, { transport: sessionTransport, server: sessionServer });
+      }
+      return;
+    }
+
+    if (sessionIdHeader && sessions.has(sessionIdHeader)) {
+      const { transport } = sessions.get(sessionIdHeader)!;
+      if (isDelegatedAuthEnabled()) {
+        const ctx = parseDelegatedAuthHeaders(req.headers as Record<string, string | string[] | undefined>);
+        await runWithDelegatedAuth(ctx, () => transport.handleRequest(req, res, parsedBody));
+      } else {
+        await transport.handleRequest(req, res, parsedBody);
+      }
+      return;
+    }
+
     if (isDelegatedAuthEnabled()) {
       const ctx = parseDelegatedAuthHeaders(req.headers as Record<string, string | string[] | undefined>);
-      await runWithDelegatedAuth(ctx, () => transport.handleRequest(req, res, parsedBody));
+      await runWithDelegatedAuth(ctx, () => defaultTransport.handleRequest(req, res, parsedBody));
     } else {
-      await transport.handleRequest(req, res, parsedBody);
+      await defaultTransport.handleRequest(req, res, parsedBody);
     }
   }, true);
 
   httpServer.get('/mcp', async (req, res) => {
-    await transport.handleRequest(req, res);
+    const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
+    if (sessionIdHeader && sessions.has(sessionIdHeader)) {
+      await sessions.get(sessionIdHeader)!.transport.handleRequest(req, res);
+    } else {
+      await defaultTransport.handleRequest(req, res);
+    }
   }, true);
 
   httpServer.delete('/mcp', async (req, res) => {
-    await transport.handleRequest(req, res);
+    const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
+    if (sessionIdHeader && sessions.has(sessionIdHeader)) {
+      await sessions.get(sessionIdHeader)!.transport.handleRequest(req, res);
+      sessions.delete(sessionIdHeader);
+    } else {
+      await defaultTransport.handleRequest(req, res);
+    }
   }, true);
 
   addHealthRoute(httpServer);
-  await server.connect(transport);
   await httpServer.start();
 }
 
