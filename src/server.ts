@@ -264,7 +264,7 @@ export function createServer(): Server {
 async function main() {
   const server = createServer();
   const tools = getTools();
-  const httpServer = await connectTransport(server, tools.length);
+  const httpServer = await connectTransport(server, tools.length, createServer);
 
   // If HTTP-based transport, mount API routes and A2A
   if (httpServer) {
