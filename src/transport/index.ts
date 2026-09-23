@@ -68,7 +68,7 @@ async function setupSseTransport(
 
   httpServer.get('/sse', async (req, res) => {
     const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'nowaikit-mcp.onrender.com';
-    const proto = (req.headers['x-forwarded-proto'] as string) || (req.socket?.encrypted ? 'https' : 'https');
+    const proto = (req.headers['x-forwarded-proto'] as string) || 'https';
 
     // Intercept res.write to emit full absolute URL in event: endpoint
     const originalWrite = res.write.bind(res);
