@@ -193,10 +193,14 @@ function parseJsonBody(req: AuthRequest): Promise<any> {
   });
 }
 
-/** Simple path matching with :param support. */
+/** Simple path matching with :param support and trailing slash normalization. */
 function matchPath(pattern: string, pathname: string): boolean {
-  const patternParts = pattern.split('/');
-  const pathParts = pathname.split('/');
+  const normPattern = pattern.replace(/\/+$/, '') || '/';
+  const normPathname = pathname.replace(/\/+$/, '') || '/';
+  if (normPattern === normPathname) return true;
+
+  const patternParts = normPattern.split('/');
+  const pathParts = normPathname.split('/');
   if (patternParts.length !== pathParts.length) return false;
   return patternParts.every((p, i) => p.startsWith(':') || p === pathParts[i]);
 }
