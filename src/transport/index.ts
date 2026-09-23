@@ -221,10 +221,13 @@ async function setupStreamableHttpTransport(
     }
   };
 
-  // Mount transport on /mcp and /
+  // Mount transport on /mcp, /sse, and /
   httpServer.post('/mcp', handlePost, false);
   httpServer.get('/mcp', handleGet, false);
   httpServer.delete('/mcp', handleDelete, false);
+
+  httpServer.post('/sse', handlePost, false);
+  httpServer.delete('/sse', handleDelete, false);
 
   httpServer.post('/', handlePost, false);
   httpServer.delete('/', handleDelete, false);
