@@ -45,6 +45,7 @@ export class NowAIKitHttpServer {
   get(path: string, handler: RouteHandler, requiresAuth = true): void { this.route('GET', path, handler, requiresAuth); }
   post(path: string, handler: RouteHandler, requiresAuth = true): void { this.route('POST', path, handler, requiresAuth); }
   delete(path: string, handler: RouteHandler, requiresAuth = true): void { this.route('DELETE', path, handler, requiresAuth); }
+  head(path: string, handler: RouteHandler, requiresAuth = true): void { this.route('HEAD', path, handler, requiresAuth); }
 
   /** Add a global middleware. */
   use(middleware: Middleware): void {
@@ -63,10 +64,12 @@ export class NowAIKitHttpServer {
       // Robust CORS headers
       const origin = req.headers.origin || this.corsOrigin;
       res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
       const reqHeaders = req.headers['access-control-request-headers'];
       res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, Authorization, *');
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      if (origin !== '*') {
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
       res.setHeader('Access-Control-Max-Age', '86400');
 
       // Handle preflight
@@ -115,10 +118,28 @@ export class NowAIKitHttpServer {
     logger.info(`[HTTP] ${method} ${pathname}${url.search}`);
 
     // Find matching route
-    const route = this.routes.find(r => {
+    let route = this.routes.find(r => {
       if (r.method !== method) return false;
       return matchPath(r.path, pathname);
     });
+
+    // Handle HEAD requests automatically if no explicit HEAD route matched
+    if (!route && method === 'HEAD') {
+      const hasRoute = this.routes.some(r => matchPath(r.path, pathname));
+      if (hasRoute || pathname === '/' || pathname === '/sse' || pathname === '/messages' || pathname === '/mcp') {
+        if (pathname === '/sse' || (pathname === '/' && req.headers.accept?.includes('text/event-stream'))) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+          });
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+        }
+        res.end();
+        return;
+      }
+    }
 
     if (!route) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
