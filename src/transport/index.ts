@@ -42,8 +42,9 @@ export async function connectTransport(
   // HTTP-based transports: mount BOTH SSE and Streamable HTTP so ALL clients work regardless of protocol!
   const httpServer = createHttpServer();
 
-  await setupSseTransport(serverFactory || (() => server), httpServer);
+  const sseHandler = await setupSseTransport(serverFactory || (() => server), httpServer);
   await setupStreamableHttpTransport(serverFactory || (() => server), httpServer);
+  addRootRoute(httpServer, sseHandler);
   addHealthRoute(httpServer);
 
   await httpServer.start();
@@ -61,14 +62,14 @@ export async function connectTransport(
 async function setupSseTransport(
   serverFactory: () => Server,
   httpServer: NowAIKitHttpServer,
-): Promise<void> {
+): Promise<(req: any, res: any) => Promise<void>> {
   const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
 
   const sessions = new Map<string, { transport: InstanceType<typeof SSEServerTransport>; server: Server }>();
 
-  httpServer.get('/sse', async (req, res) => {
-    const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'nowaikit-mcp.onrender.com';
-    const proto = (req.headers['x-forwarded-proto'] as string) || 'https';
+  const sseConnectHandler = async (req: any, res: any): Promise<void> => {
+    const host = ((req.headers['x-forwarded-host'] as string) || '').split(',')[0].trim() || req.headers.host || 'nowaikit-mcp.onrender.com';
+    const proto = ((req.headers['x-forwarded-proto'] as string) || '').split(',')[0].trim() || 'https';
 
     // Intercept res.write to emit full absolute URL in event: endpoint
     const originalWrite = res.write.bind(res);
@@ -100,7 +101,9 @@ async function setupSseTransport(
 
     await sessionServer.connect(transport);
     logger.info(`SSE session connected: ${sessionId} (endpoint: ${proto}://${host}/messages?sessionId=${sessionId})`);
-  }, true);
+  };
+
+  httpServer.get('/sse', sseConnectHandler, false);
 
   httpServer.post('/messages', async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -119,7 +122,18 @@ async function setupSseTransport(
     const body = (req as { body?: unknown }).body;
     logger.info(`[MCP] Dispatching message to transport for session: ${sessionId}`);
     await transport.handlePostMessage(req, res, body);
-  }, true);
+  }, false);
+
+  httpServer.get('/messages', async (_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      endpoint: 'messages',
+      message: 'MCP messages endpoint. Send POST requests with JSON-RPC messages.',
+    }));
+  }, false);
+
+  return sseConnectHandler;
 }
 
 /**
@@ -139,8 +153,7 @@ async function setupStreamableHttpTransport(
   const defaultTransport = new StreamableHTTPServerTransport();
   await defaultServer.connect(defaultTransport);
 
-  // Mount transport on /mcp
-  httpServer.post('/mcp', async (req, res) => {
+  const handlePost = async (req: any, res: any) => {
     const parsedBody = (req as { body?: unknown }).body;
     const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
 
@@ -187,18 +200,18 @@ async function setupStreamableHttpTransport(
     } else {
       await defaultTransport.handleRequest(req, res, parsedBody);
     }
-  }, true);
+  };
 
-  httpServer.get('/mcp', async (req, res) => {
+  const handleGet = async (req: any, res: any) => {
     const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
     if (sessionIdHeader && sessions.has(sessionIdHeader)) {
       await sessions.get(sessionIdHeader)!.transport.handleRequest(req, res);
     } else {
       await defaultTransport.handleRequest(req, res);
     }
-  }, true);
+  };
 
-  httpServer.delete('/mcp', async (req, res) => {
+  const handleDelete = async (req: any, res: any) => {
     const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
     if (sessionIdHeader && sessions.has(sessionIdHeader)) {
       await sessions.get(sessionIdHeader)!.transport.handleRequest(req, res);
@@ -206,7 +219,45 @@ async function setupStreamableHttpTransport(
     } else {
       await defaultTransport.handleRequest(req, res);
     }
-  }, true);
+  };
+
+  // Mount transport on /mcp and /
+  httpServer.post('/mcp', handlePost, false);
+  httpServer.get('/mcp', handleGet, false);
+  httpServer.delete('/mcp', handleDelete, false);
+
+  httpServer.post('/', handlePost, false);
+  httpServer.delete('/', handleDelete, false);
+}
+
+/** Root route — handles SSE stream when requested via Accept: text/event-stream, or returns JSON server metadata */
+function addRootRoute(
+  httpServer: NowAIKitHttpServer,
+  sseHandler: (req: any, res: any) => Promise<void>,
+): void {
+  httpServer.get('/', async (req, res) => {
+    if (req.headers.accept?.includes('text/event-stream')) {
+      return sseHandler(req, res);
+    }
+    const { getTools } = await import('../tools/index.js');
+    const tools = getTools();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      name: SERVER_NAME,
+      version: VERSION,
+      transport: 'sse+http',
+      tools_count: tools.length,
+      endpoints: {
+        sse: '/sse',
+        messages: '/messages',
+        mcp: '/mcp',
+        health: '/health',
+      },
+      message: 'NowAIKit MCP Server is online and ready.',
+      timestamp: new Date().toISOString(),
+    }));
+  }, false);
 }
 
 /** Shared health endpoint — no auth required. */
