@@ -39,16 +39,16 @@ export async function connectTransport(
     return null;
   }
 
-  // HTTP-based transports (SSE or Streamable HTTP)
+  // HTTP-based transports: mount BOTH SSE and Streamable HTTP so ALL clients work regardless of protocol!
   const httpServer = createHttpServer();
 
-  if (transportType === 'sse') {
-    await setupSseTransport(serverFactory || (() => server), httpServer);
-  } else {
-    await setupStreamableHttpTransport(serverFactory || (() => server), httpServer);
-  }
+  await setupSseTransport(serverFactory || (() => server), httpServer);
+  await setupStreamableHttpTransport(serverFactory || (() => server), httpServer);
+  addHealthRoute(httpServer);
 
-  logger.info(`NowAIKit server running on ${transportType} [${toolCount} tools]`);
+  await httpServer.start();
+
+  logger.info(`NowAIKit server running on sse + http [${toolCount} tools]`);
   return httpServer;
 }
 
@@ -56,6 +56,7 @@ export async function connectTransport(
  * SSE Transport — GET /sse opens an SSE stream, POST /messages sends client messages.
  * Uses Factory Pattern: creates an isolated Server instance for each incoming SSE connection
  * to prevent "Already connected to a transport" crashes on reconnect/multi-client.
+ * Also emits a fully-qualified absolute URL in the "endpoint" event for strict clients.
  */
 async function setupSseTransport(
   serverFactory: () => Server,
@@ -66,6 +67,27 @@ async function setupSseTransport(
   const sessions = new Map<string, { transport: InstanceType<typeof SSEServerTransport>; server: Server }>();
 
   httpServer.get('/sse', async (req, res) => {
+    const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 'nowaikit-mcp.onrender.com';
+    const proto = (req.headers['x-forwarded-proto'] as string) || (req.socket?.encrypted ? 'https' : 'https');
+
+    // Intercept res.write to emit full absolute URL in event: endpoint
+    const originalWrite = res.write.bind(res);
+    res.write = function (chunk: any, encoding?: any, callback?: any): boolean {
+      const str = typeof chunk === 'string' ? chunk : chunk instanceof Buffer ? chunk.toString() : '';
+      if (str.includes('event: endpoint\ndata: ')) {
+        const rewritten = str.replace(
+          /event: endpoint\ndata: ([^\r\n]+)/,
+          (_match: string, path: string) => {
+            const cleanPath = path.trim();
+            const abs = cleanPath.startsWith('http') ? cleanPath : `${proto}://${host}${cleanPath.startsWith('/') ? '' : '/'}${cleanPath}`;
+            return `event: endpoint\ndata: ${abs}`;
+          }
+        );
+        return originalWrite(rewritten, encoding, callback);
+      }
+      return originalWrite(chunk, encoding, callback);
+    } as any;
+
     const transport = new SSEServerTransport('/messages', res);
     const sessionId = transport.sessionId;
     const sessionServer = serverFactory();
@@ -77,28 +99,27 @@ async function setupSseTransport(
     });
 
     await sessionServer.connect(transport);
-    logger.info(`SSE session connected: ${sessionId}`);
+    logger.info(`SSE session connected: ${sessionId} (endpoint: ${proto}://${host}/messages?sessionId=${sessionId})`);
   }, true);
 
   httpServer.post('/messages', async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const sessionId = url.searchParams.get('sessionId');
 
+    logger.info(`[MCP] POST /messages for sessionId: ${sessionId}`);
+
     if (!sessionId || !sessions.has(sessionId)) {
+      logger.warn(`[MCP] Session not found for sessionId: ${sessionId}`);
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Invalid or missing sessionId' }));
       return;
     }
 
     const { transport } = sessions.get(sessionId)!;
-    // Pass the already-parsed body (the HTTP server drained the stream) — same
-    // reason as the streamable-HTTP path below.
-    await transport.handlePostMessage(req, res, (req as { body?: unknown }).body);
+    const body = (req as { body?: unknown }).body;
+    logger.info(`[MCP] Dispatching message to transport for session: ${sessionId}`);
+    await transport.handlePostMessage(req, res, body);
   }, true);
-
-  // Health endpoint (no auth required)
-  addHealthRoute(httpServer);
-  await httpServer.start();
 }
 
 /**
@@ -128,6 +149,7 @@ async function setupStreamableHttpTransport(
       : (parsedBody as any)?.method === 'initialize';
 
     if (isInit) {
+      logger.info('[MCP] Streamable HTTP initialize request received');
       const sessionServer = serverFactory();
       const sessionTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -143,6 +165,7 @@ async function setupStreamableHttpTransport(
 
       if (sessionTransport.sessionId) {
         sessions.set(sessionTransport.sessionId, { transport: sessionTransport, server: sessionServer });
+        logger.info(`[MCP] Streamable HTTP session registered: ${sessionTransport.sessionId}`);
       }
       return;
     }
@@ -184,9 +207,6 @@ async function setupStreamableHttpTransport(
       await defaultTransport.handleRequest(req, res);
     }
   }, true);
-
-  addHealthRoute(httpServer);
-  await httpServer.start();
 }
 
 /** Shared health endpoint — no auth required. */
@@ -199,7 +219,7 @@ function addHealthRoute(httpServer: NowAIKitHttpServer): void {
       status: 'ok',
       name: SERVER_NAME,
       version: VERSION,
-      transport: getTransportType(),
+      transport: 'sse+http',
       tools_count: tools.length,
       timestamp: new Date().toISOString(),
     }));
