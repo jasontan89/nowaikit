@@ -60,14 +60,18 @@ export class NowAIKitHttpServer {
   /** Start listening. */
   async start(): Promise<void> {
     this.server = createServer(async (req: AuthRequest, res) => {
-      // CORS headers
-      res.setHeader('Access-Control-Allow-Origin', this.corsOrigin);
+      // Robust CORS headers
+      const origin = req.headers.origin || this.corsOrigin;
+      res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      const reqHeaders = req.headers['access-control-request-headers'];
+      res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, Authorization, *');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Max-Age', '86400');
 
       // Handle preflight
       if (req.method === 'OPTIONS') {
+        logger.info(`[CORS] Handled OPTIONS preflight for ${req.url}`);
         res.writeHead(204);
         res.end();
         return;
@@ -107,6 +111,8 @@ export class NowAIKitHttpServer {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
     const method = req.method?.toUpperCase() || 'GET';
+
+    logger.info(`[HTTP] ${method} ${pathname}${url.search}`);
 
     // Find matching route
     const route = this.routes.find(r => {
